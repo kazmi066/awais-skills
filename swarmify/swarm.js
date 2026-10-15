@@ -1,0 +1,907 @@
+const COLORS = [
+  "#F24E1E",
+  "#A259FF",
+  "#1ABCFE",
+  "#0ACF83",
+  "#FF7262",
+  "#FFC700",
+  "#9747FF",
+  "#E8467C",
+  "#14AE5C",
+  "#0D99FF",
+  "#FF8A00",
+  "#00B5CE",
+];
+
+const ARROW =
+  "M4.6 3.9 C4.2 3.1 4.9 2.4 5.7 2.8 L20.6 9.4 C21.5 9.8 21.4 11.1 20.4 11.3 L13.9 12.9 C13.4 13 13 13.4 12.9 13.9 L11.3 20.4 C11.1 21.4 9.8 21.5 9.4 20.6 Z";
+const IBEAM =
+  "M8.5 4.5 H10.5 Q12 4.5 12 6 Q12 4.5 13.5 4.5 H15.5 M12 6 V18 M8.5 19.5 H10.5 Q12 19.5 12 18 Q12 19.5 13.5 19.5 H15.5";
+const HOT = { arrow: [5, 3.5], cross: [12, 12], ibeam: [12, 12] };
+
+const SEED = 12;
+const KEEP = 7;
+const MAX_BUILD = 24;
+const MAX_FLOCK = 32;
+
+const rand = (min, max) => min + Math.random() * (max - min);
+const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+const easeInOut = (t) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
+const easeOut = (t) => 1 - Math.pow(1 - t, 3);
+
+class SwarmEngine {
+  constructor(options = {}) {
+    this.root = options.root || document;
+    this.cursors = [];
+    this.tasks = [];
+    this.started = false;
+    this.flocking = false;
+    this.time = 0;
+    this.tempo = 1.7;
+    this.pageWidth = 0;
+    this.pageHeight = 0;
+    this.scrollY = 0;
+    this.viewHeight = 800;
+    this.viewWidth = 1280;
+    this.nextId = 0;
+    this.frontier = 0;
+    this.velocity = 0;
+    this.lastScroll = 0;
+    this.spawnCooldown = 0;
+    this.pointer = null;
+    this.lastPointer = null;
+    this.travel = { x: 0, y: 0 };
+    this.onMove = (event) => {
+      this.pointer = { x: event.clientX, y: event.clientY };
+    };
+    this.onLeave = () => {
+      this.pointer = null;
+      this.lastPointer = null;
+    };
+
+    document.documentElement.dataset.swarmLive = "1";
+    if (options.scrollToTop !== false && "scrollRestoration" in history) {
+      history.scrollRestoration = "manual";
+    }
+    this.readViewport();
+    this.collect();
+    if (options.scrollToTop !== false && this.tasks.length) window.scrollTo(0, 0);
+    this.readViewport();
+    this.seed();
+    window.addEventListener("pointermove", this.onMove);
+    window.addEventListener("pointerleave", this.onLeave);
+  }
+
+  destroy() {
+    window.removeEventListener("pointermove", this.onMove);
+    window.removeEventListener("pointerleave", this.onLeave);
+    for (const cursor of this.cursors) cursor.gen?.return();
+  }
+
+  step(dt) {
+    dt = Math.min(dt, 0.05);
+    if (dt <= 0) return;
+    this.time += dt;
+    this.readViewport();
+    this.pageWidth = document.documentElement.scrollWidth;
+    this.pageHeight = document.documentElement.scrollHeight;
+
+    const delta = Math.abs(this.scrollY - this.lastScroll) / dt;
+    this.lastScroll = this.scrollY;
+    this.velocity = Math.max(
+      this.velocity * Math.exp(-dt * 1.2),
+      this.velocity * 0.7 + delta * 0.3
+    );
+
+    if (!this.started && (this.time > 1.2 || this.scrollY > 8)) this.begin();
+    if (this.started) this.frontier = Math.max(this.frontier, this.viewBottom + 90);
+
+    this.refreshWaiting(dt);
+
+    if (this.flocking) {
+      this.spawnFlock(dt);
+      this.follow(dt, this.cursors);
+      return;
+    }
+
+    if (!this.started) {
+      if (this.follow(dt, this.cursors, this.contentCenter(), 0.72)) this.begin();
+      return;
+    }
+
+    const waiting = this.available();
+    this.tempo = clamp(
+      1.15 + this.velocity / 1100 + (waiting.length / Math.max(1, this.cursors.length)) * 0.35,
+      1.15,
+      3.4
+    );
+
+    this.spawnCooldown -= dt;
+    const busy = this.cursors.filter((cursor) => cursor.task).length;
+    const present = this.cursors.filter((cursor) => !cursor.leaving).length;
+    const targetCount = clamp(
+      6 + Math.floor(this.velocity / 90) + Math.floor(waiting.length / 4),
+      6,
+      MAX_BUILD
+    );
+    if (present < targetCount && waiting.length > present - busy && this.spawnCooldown <= 0) {
+      const point = this.edgePoint();
+      this.cursors.push(this.makeCursor(point.x, point.y));
+      this.spawnCooldown = 0.045;
+    }
+
+    const pool = this.available();
+    for (const cursor of this.cursors) {
+      if (cursor.task || cursor.leaving || cursor.follow) continue;
+      const task = this.pick(cursor, pool);
+      if (!task) continue;
+      pool.splice(pool.indexOf(task), 1);
+      task.state = "active";
+      cursor.task = task;
+      cursor.worked = true;
+      cursor.idleFor = 0;
+      cursor.gen?.return();
+      cursor.gen = task.kind === "type" ? this.typeText(cursor, task) : this.drawBox(cursor, task);
+    }
+
+    for (const cursor of [...this.cursors]) {
+      if (cursor.follow) continue;
+      cursor.press = Math.max(0, cursor.press - dt * 6);
+      if (!cursor.task && !cursor.leaving) {
+        cursor.idleFor += dt;
+        if (!cursor.gen && cursor.idleFor > 0.08) {
+          const alive = this.cursors.filter((item) => !item.leaving).length;
+          if (cursor.idleFor > 2.5 && alive > KEEP) {
+            cursor.leaving = true;
+            cursor.gen = this.leave(cursor);
+          } else {
+            cursor.gen = this.idle(cursor);
+          }
+        }
+      }
+      if (!cursor.gen) continue;
+      const previousX = cursor.x;
+      const previousY = cursor.y;
+      let finished = false;
+      try {
+        finished = Boolean(cursor.gen.next(dt).done);
+      } catch (error) {
+        console.error(error);
+        finished = true;
+        if (cursor.task) cursor.task.el.dataset.built = "1";
+      }
+      cursor.vx = (cursor.x - previousX) / dt;
+      cursor.vy = (cursor.y - previousY) / dt;
+      this.aim(cursor, dt);
+      if (!finished) continue;
+      if (cursor.task) {
+        const task = cursor.task;
+        task.state = "done";
+        task.showProxy = false;
+        task.showSelection = false;
+        task.draw = null;
+        task.caret = null;
+        if (!task.el.dataset.built) task.el.dataset.built = "1";
+        cursor.task = null;
+        cursor.shape = "arrow";
+      }
+      cursor.gen = null;
+      if (cursor.leaving) {
+        const index = this.cursors.indexOf(cursor);
+        if (index >= 0) this.cursors.splice(index, 1);
+      }
+    }
+
+    if (this.tasks.length && this.tasks.every((task) => task.state === "done")) {
+      for (const cursor of this.cursors) {
+        if (cursor.task || cursor.follow) continue;
+        cursor.follow = true;
+        cursor.leaving = false;
+        cursor.gen?.return();
+        cursor.gen = null;
+        cursor.shape = "arrow";
+      }
+      if (this.cursors.every((cursor) => cursor.follow)) this.flocking = true;
+    }
+  }
+
+  begin() {
+    if (this.started) return;
+    this.started = true;
+    this.frontier = this.viewBottom + 90;
+    for (const cursor of this.cursors) {
+      cursor.follow = false;
+      cursor.gen?.return();
+      cursor.gen = null;
+    }
+  }
+
+  get viewTop() {
+    return this.scrollY;
+  }
+
+  get viewBottom() {
+    return this.scrollY + this.viewHeight;
+  }
+
+  readViewport() {
+    this.scrollY = window.scrollY;
+    this.viewHeight = window.innerHeight;
+    this.viewWidth = window.innerWidth;
+  }
+
+  pagePointer() {
+    if (!this.pointer) return null;
+    return {
+      x: this.pointer.x + window.scrollX,
+      y: this.pointer.y + this.scrollY,
+    };
+  }
+
+  contentBand() {
+    const placed = this.tasks.filter((task) => task.w > 8);
+    if (!placed.length) {
+      const mid = this.viewWidth / 2;
+      return { left: mid - 280, right: mid + 280 };
+    }
+    return {
+      left: Math.min(...placed.map((task) => task.x)),
+      right: Math.max(...placed.map((task) => task.x + task.w)),
+    };
+  }
+
+  contentCenter() {
+    const band = this.contentBand();
+    return {
+      x: (band.left + band.right) / 2,
+      y: this.scrollY + this.viewHeight * 0.46,
+    };
+  }
+
+  edgePoint() {
+    const band = this.contentBand();
+    const fromLeft = Math.random() < 0.5;
+    return {
+      x: fromLeft ? band.left - 28 : band.right + 28,
+      y: this.scrollY + rand(0.2, 0.8) * this.viewHeight,
+    };
+  }
+
+  collect() {
+    const scope = this.root === document ? document : this.root;
+    scope.querySelectorAll("[data-swarm]").forEach((el, index) => {
+      const kind = el.dataset.swarm;
+      if (kind !== "frame" && kind !== "card" && kind !== "type") return;
+      el.removeAttribute("data-built");
+      el.style.removeProperty("--swarm-p");
+      delete el.dataset.reveal;
+      const task = {
+        id: String(index),
+        el,
+        kind,
+        x: 0,
+        y: 0,
+        w: 0,
+        h: 0,
+        radius: 0,
+        state: "wait",
+        draw: null,
+        showProxy: false,
+        showSelection: false,
+        handles: kind !== "type",
+        progress: 0,
+        lines: 1,
+        caret: null,
+        visibleFor: 0,
+      };
+      this.measure(task, true);
+      this.tasks.push(task);
+    });
+  }
+
+  measure(task, readRadius = false) {
+    const rect = task.el.getBoundingClientRect();
+    task.x = rect.left + window.scrollX;
+    task.y = rect.top + window.scrollY;
+    task.w = rect.width;
+    task.h = rect.height;
+    if (readRadius) {
+      const radius = parseFloat(getComputedStyle(task.el).borderRadius) || 0;
+      task.radius = Math.max(0, Math.min(radius, task.w / 2, task.h / 2));
+    }
+  }
+
+  refreshWaiting(dt) {
+    for (const task of this.tasks) {
+      if (task.state !== "wait") continue;
+      this.measure(task);
+      const inView = task.y < this.viewBottom && task.y + task.h > this.viewTop;
+      task.visibleFor = inView ? task.visibleFor + dt : 0;
+      if (task.w < 1 || task.h < 1 || task.visibleFor > 8) {
+        task.state = "done";
+        task.el.dataset.built = "1";
+      }
+    }
+  }
+
+  available() {
+    return this.tasks.filter(
+      (task) => task.state === "wait" && task.y <= this.frontier && task.w > 1 && task.h > 1
+    );
+  }
+
+  pick(cursor, tasks) {
+    let best = null;
+    let bestScore = Infinity;
+    const top = this.viewTop - 40;
+    const bottom = this.viewBottom;
+    for (const task of tasks) {
+      const band = task.y >= top && task.y <= bottom ? 0 : task.y < top ? 1 : 2;
+      const distance = band === 1 ? top - task.y : task.y;
+      const score = band * 1_000_000 + distance * 0.6 + Math.abs(task.y - cursor.y) * 0.4;
+      if (score < bestScore) {
+        bestScore = score;
+        best = task;
+      }
+    }
+    return best;
+  }
+
+  seed() {
+    const center = this.contentCenter();
+    for (let index = 0; index < SEED; index += 1) {
+      const angle = (index / SEED) * Math.PI * 2;
+      const cursor = this.makeCursor(
+        center.x + Math.cos(angle) * 150,
+        center.y + Math.sin(angle) * 86
+      );
+      cursor.follow = true;
+      this.cursors.push(cursor);
+    }
+  }
+
+  makeCursor(x, y) {
+    const fast = Math.random() < 0.25;
+    const id = this.nextId++;
+    return {
+      id,
+      x,
+      y,
+      vx: 0,
+      vy: 0,
+      angle: 0,
+      color: COLORS[id % COLORS.length],
+      shape: "arrow",
+      press: 0,
+      speed: fast ? rand(1000, 1500) : rand(320, 760),
+      force: fast ? rand(3500, 6000) : rand(700, 1800),
+      spin: fast ? rand(2.2, 3.4) : rand(0.8, 1.8),
+      curl: rand(-1, 1),
+      orbit: rand(70, 170),
+      follow: false,
+      leaving: false,
+      task: null,
+      gen: null,
+      idleFor: 0,
+      worked: false,
+    };
+  }
+
+  spawnFlock(dt) {
+    this.spawnCooldown -= dt;
+    if (this.cursors.length >= MAX_FLOCK || this.spawnCooldown > 0) return;
+    const point = this.edgePoint();
+    const cursor = this.makeCursor(point.x, point.y);
+    cursor.follow = true;
+    this.cursors.push(cursor);
+    this.spawnCooldown = 0.05;
+  }
+
+  follow(dt, group, override, scale = 1) {
+    const target = override || this.flockTarget();
+    const mouse = this.pagePointer();
+    if (mouse && this.lastPointer && dt > 0) {
+      const blend = Math.min(1, dt * 18);
+      this.travel.x += ((mouse.x - this.lastPointer.x) / dt - this.travel.x) * blend;
+      this.travel.y += ((mouse.y - this.lastPointer.y) / dt - this.travel.y) * blend;
+    }
+    this.lastPointer = mouse;
+
+    const orbitBase = 135 * scale * (1 + 0.18 * Math.sin(this.time * 0.55));
+    const spinSign = Math.tanh(Math.cos(this.time * 0.11) * 3);
+    const desired = group.map((cursor) => {
+      const dx = cursor.x - target.x;
+      const dy = cursor.y - target.y;
+      const dist = Math.hypot(dx, dy) || 0.01;
+      const nx = dx / dist;
+      const ny = dy / dist;
+      const heading = Math.atan2(dy, dx);
+      const radius =
+        orbitBase * (1 + 0.3 * Math.sin(3 * heading + this.time * 0.7)) +
+        (cursor.orbit - 120) * 0.55 * scale;
+      const tangent = 300 * (0.7 + cursor.spin * 0.2) * spinSign;
+      const radial = clamp((radius - dist) * 4, -2600, 1400);
+      const spill = clamp((dist - radius) / 600, 0, 1);
+      return {
+        x: -ny * tangent + nx * radial - ny * cursor.curl * 400 * spill,
+        y: nx * tangent + ny * radial + nx * cursor.curl * 400 * spill,
+      };
+    });
+
+    for (let index = 0; index < group.length; index += 1) {
+      const cursor = group[index];
+      let ax = desired[index].x;
+      let ay = desired[index].y;
+      let alignX = 0;
+      let alignY = 0;
+      let weight = 0;
+      for (let other = 0; other < group.length; other += 1) {
+        if (other === index) continue;
+        const mate = group[other];
+        const dist = Math.hypot(mate.x - cursor.x, mate.y - cursor.y);
+        if (dist > 90) continue;
+        const influence = 1 - dist / 90;
+        alignX += mate.vx * influence;
+        alignY += mate.vy * influence;
+        weight += influence;
+      }
+      if (weight > 0) {
+        ax = ax * 0.7 + (alignX / weight) * 0.3;
+        ay = ay * 0.7 + (alignY / weight) * 0.3;
+      }
+      const outside = Math.max(0, Math.hypot(cursor.x - target.x, cursor.y - target.y) - 180 * scale);
+      const maxSpeed = cursor.speed * (1.3 + Math.min(3.2, outside / 90));
+      const magnitude = Math.hypot(ax, ay);
+      if (magnitude > maxSpeed) {
+        ax = (ax * maxSpeed) / magnitude;
+        ay = (ay * maxSpeed) / magnitude;
+      }
+      let forceX = (ax - cursor.vx) * 6;
+      let forceY = (ay - cursor.vy) * 6;
+      const maxForce = cursor.force * (1.4 + Math.min(5, outside / 50));
+      const force = Math.hypot(forceX, forceY);
+      if (force > maxForce) {
+        forceX = (forceX * maxForce) / force;
+        forceY = (forceY * maxForce) / force;
+      }
+      cursor.vx += forceX * dt;
+      cursor.vy += forceY * dt;
+      cursor.x += cursor.vx * dt;
+      cursor.y += cursor.vy * dt;
+    }
+
+    let touched = false;
+    if (mouse) {
+      for (const cursor of group) {
+        const dx = cursor.x - mouse.x;
+        const dy = cursor.y - mouse.y;
+        const dist = Math.hypot(dx, dy) || 0.01;
+        if (dist >= 48) continue;
+        touched = true;
+        const nx = dx / dist;
+        const ny = dy / dist;
+        cursor.x = mouse.x + nx * 48;
+        cursor.y = mouse.y + ny * 48;
+        const approach = (cursor.vx - this.travel.x) * nx + (cursor.vy - this.travel.y) * ny;
+        if (approach < 0) {
+          cursor.vx -= nx * approach * 1.6;
+          cursor.vy -= ny * approach * 1.6;
+        }
+        cursor.vx += nx * 260;
+        cursor.vy += ny * 260;
+      }
+    }
+
+    for (const cursor of group) {
+      cursor.press = Math.max(0, cursor.press - dt * 6);
+      this.aim(cursor, dt);
+    }
+    return touched;
+  }
+
+  flockTarget() {
+    const band = this.contentBand();
+    const mouse = this.pagePointer();
+    const t = this.time;
+    const span = Math.max(32, band.right - band.left);
+    const rawX = mouse ? mouse.x : band.left + span * (0.5 + 0.22 * Math.sin(t * 0.37));
+    const rawY = mouse
+      ? mouse.y
+      : this.scrollY + this.viewHeight * (0.5 + 0.18 * Math.sin(t * 0.53 + 1));
+    return {
+      x: clamp(rawX, band.left + 16, band.right - 16),
+      y: rawY,
+    };
+  }
+
+  aim(cursor, dt) {
+    if (cursor.shape === "cross" || cursor.shape === "ibeam") {
+      cursor.angle += (0 - cursor.angle) * Math.min(1, dt * 12);
+      return;
+    }
+    const speed = Math.hypot(cursor.vx, cursor.vy);
+    if (speed < 36) {
+      cursor.angle = Math.abs(cursor.angle) < 0.5 ? 0 : cursor.angle * (1 - Math.min(1, dt * 8));
+      return;
+    }
+    const target = (Math.atan2(cursor.vy, cursor.vx) * 180) / Math.PI + 128;
+    const delta = (((target - cursor.angle + 540) % 360) + 360) % 360 - 180;
+    cursor.angle += delta * Math.min(1, dt * 8);
+  }
+
+  *wait(seconds) {
+    let elapsed = 0;
+    while (elapsed < seconds) elapsed += (yield) * this.tempo;
+  }
+
+  *moveTo(cursor, dest, options = {}) {
+    const point = () => (typeof dest === "function" ? dest() : dest);
+    const originX = cursor.x;
+    const originY = cursor.y;
+    const first = point();
+    const distance = Math.hypot(first.x - originX, first.y - originY);
+    if (distance < 0.6) {
+      cursor.x = first.x;
+      cursor.y = first.y;
+      options.onStep?.();
+      return;
+    }
+    const duration = clamp(0.12 + Math.sqrt(distance) * 0.021, 0.14, 0.9) / (options.speed ?? 1);
+    const bend = (options.bend ?? (Math.random() < 0.5 ? -1 : 1) * rand(0.04, 0.14)) * Math.min(distance, 600);
+    let elapsed = 0;
+    while (elapsed < duration) {
+      elapsed += (yield) * this.tempo;
+      const progress = Math.min(1, elapsed / duration);
+      const eased = options.drag || progress < 0.15 ? easeInOut(progress) : easeOut(progress);
+      const next = point();
+      const dx = next.x - originX;
+      const dy = next.y - originY;
+      const length = Math.hypot(dx, dy) || 1;
+      const offset = Math.sin(Math.PI * eased) * bend;
+      cursor.x = originX + dx * eased + (-dy / length) * offset;
+      cursor.y = originY + dy * eased + (dx / length) * offset;
+      options.onStep?.();
+    }
+    const end = point();
+    cursor.x = end.x;
+    cursor.y = end.y;
+    options.onStep?.();
+  }
+
+  *drawBox(cursor, task) {
+    this.measure(task, true);
+    const origin = { x: task.x, y: task.y };
+    const end = { x: task.x + task.w, y: task.y + task.h };
+    cursor.shape = "cross";
+    yield* this.moveTo(cursor, origin);
+    cursor.press = 1;
+    task.showProxy = true;
+    task.showSelection = true;
+    task.draw = { ...origin, w: 0, h: 0 };
+    try {
+      yield* this.moveTo(cursor, end, {
+        speed: 0.62,
+        drag: true,
+        bend: 0,
+        onStep: () => {
+          const width = cursor.x - origin.x;
+          const height = cursor.y - origin.y;
+          task.draw = {
+            x: width < 0 ? cursor.x : origin.x,
+            y: height < 0 ? cursor.y : origin.y,
+            w: Math.abs(width),
+            h: Math.abs(height),
+          };
+        },
+      });
+      task.draw = { x: origin.x, y: origin.y, w: task.w, h: task.h };
+      cursor.shape = "arrow";
+      yield* this.wait(rand(0.2, 0.34));
+      task.el.dataset.built = "1";
+      yield* this.wait(0.28);
+      task.showProxy = false;
+      yield* this.wait(0.42);
+      task.showSelection = false;
+      task.draw = null;
+    } finally {
+      task.showProxy = false;
+      task.showSelection = false;
+    }
+  }
+
+  *typeText(cursor, task) {
+    this.measure(task, true);
+    const text = (task.el.innerText || "").replace(/\s+/g, " ").trim();
+    const vertical = task.h > 42;
+    task.el.dataset.reveal = vertical ? "y" : "x";
+    if (!vertical) this.measure(task);
+    this.prepareLines(task);
+    task.el.style.setProperty("--swarm-p", "0");
+    cursor.shape = "arrow";
+    yield* this.moveTo(cursor, {
+      x: task.x + 2,
+      y: task.y + Math.min(task.h - 4, this.lineHeight(task) * 0.75),
+    });
+    cursor.press = 1;
+    cursor.shape = "ibeam";
+    task.showSelection = true;
+    if (!text) {
+      task.el.dataset.built = "1";
+      task.showSelection = false;
+      cursor.shape = "arrow";
+      return;
+    }
+    const count = text.length;
+    for (let index = 1; index <= count; index += 1) {
+      task.progress = index / count;
+      this.applyTypeClip(task, vertical);
+      this.placeCaret(cursor, task, vertical);
+      let delay = count > 90 ? rand(0.004, 0.01) : rand(0.012, 0.032);
+      if (text[index - 1] === " ") delay += rand(0, 0.018);
+      if (Math.random() < 0.02) delay += rand(0.05, 0.14);
+      yield* this.wait(delay);
+    }
+    task.el.dataset.built = "1";
+    task.el.style.removeProperty("--swarm-p");
+    task.el.style.clipPath = "";
+    cursor.shape = "arrow";
+    task.caret = null;
+    yield* this.wait(0.16);
+    task.showSelection = false;
+  }
+
+  lineHeight(task) {
+    return task.h / Math.max(1, task.lines);
+  }
+
+  prepareLines(task) {
+    const style = getComputedStyle(task.el);
+    const fontSize = parseFloat(style.fontSize) || 14;
+    const parsed = parseFloat(style.lineHeight);
+    const lineHeight = Number.isFinite(parsed) ? parsed : fontSize * 1.45;
+    task.lines = Math.max(1, Math.round(task.h / lineHeight));
+  }
+
+  typeMark(task) {
+    const lines = Math.max(1, task.lines);
+    const pos = Math.min(lines, task.progress * lines);
+    const line = Math.min(lines - 1, Math.floor(Math.min(pos, lines - 0.0001)));
+    const across = Math.min(1, Math.max(0, pos - line));
+    return { lines, line, across };
+  }
+
+  applyTypeClip(task, vertical) {
+    if (!vertical) {
+      task.el.style.clipPath = "";
+      task.el.style.setProperty("--swarm-p", task.progress.toFixed(4));
+      return;
+    }
+    const { lines, line, across } = this.typeMark(task);
+    const top = (line / lines) * 100;
+    const bottom = ((line + 1) / lines) * 100;
+    const x = across * 100;
+    task.el.style.clipPath = `polygon(0 0, 100% 0, 100% ${top}%, ${x}% ${top}%, ${x}% ${bottom}%, 0 ${bottom}%)`;
+  }
+
+  placeCaret(cursor, task, vertical) {
+    if (vertical) {
+      const { line, across } = this.typeMark(task);
+      const lineHeight = this.lineHeight(task);
+      task.caret = {
+        x: task.x + Math.min(task.w - 2, Math.max(0, task.w * across)),
+        y: task.y + line * lineHeight + 1,
+        h: Math.max(12, lineHeight - 3),
+        color: cursor.color,
+      };
+    } else {
+      task.caret = {
+        x: task.x + task.w * task.progress,
+        y: task.y + task.h * 0.16,
+        h: Math.max(10, task.h * 0.68),
+        color: cursor.color,
+      };
+    }
+    cursor.x = task.caret.x + 8;
+    cursor.y = task.caret.y + task.caret.h * 0.65;
+  }
+
+  *idle(cursor) {
+    const band = this.contentBand();
+    const x = rand(band.left + 24, Math.max(band.left + 48, band.right - 24));
+    const yRatio = rand(0.18, 0.82);
+    yield* this.moveTo(
+      cursor,
+      () => ({ x, y: this.scrollY + yRatio * this.viewHeight }),
+      { speed: 0.5 }
+    );
+  }
+
+  *leave(cursor) {
+    const band = this.contentBand();
+    const toRight = cursor.x > (band.left + band.right) / 2;
+    yield* this.moveTo(
+      cursor,
+      () => ({
+        x: toRight ? band.right + 48 : band.left - 48,
+        y: cursor.y,
+      }),
+      { speed: 0.85 }
+    );
+  }
+}
+
+function glyph(shape, color) {
+  if (shape === "cross") {
+    return `<g stroke-linecap="round"><path d="M12 3.5 V20.5 M3.5 12 H20.5" stroke="#fff" stroke-width="3.6"/><path d="M12 3.5 V20.5 M3.5 12 H20.5" stroke="${color}" stroke-width="1.5"/></g>`;
+  }
+  if (shape === "ibeam") {
+    return `<g fill="none" stroke-linecap="round"><path d="${IBEAM}" stroke="#fff" stroke-width="3.6"/><path d="${IBEAM}" stroke="${color}" stroke-width="1.5"/></g>`;
+  }
+  return `<path d="${ARROW}" fill="${color}" stroke="#fff" stroke-width="1.5" stroke-linejoin="round"/>`;
+}
+
+function mount(layer) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", "swarm-svg");
+  layer.appendChild(svg);
+
+  const cursors = new Map();
+  const badges = new Map();
+  const carets = new Map();
+
+  return function paint(engine) {
+    layer.style.height = `${engine.pageHeight}px`;
+    svg.setAttribute("width", String(Math.max(engine.pageWidth, 1)));
+    svg.setAttribute("height", String(Math.max(engine.pageHeight, 1)));
+
+    const shapes = [];
+    const liveBadges = new Set();
+    const liveCarets = new Set();
+
+    for (const task of engine.tasks) {
+      const box = task.draw || task;
+      if ((task.showProxy || task.showSelection) && box.w >= 1 && box.h >= 1) {
+        if (task.showProxy) {
+          shapes.push(
+            `<rect x="${box.x}" y="${box.y}" width="${box.w}" height="${box.h}" rx="${task.radius}" fill="#ffffff" stroke="#D7DADE" stroke-width="1.5"/>`
+          );
+        }
+        if (task.showSelection) {
+          shapes.push(
+            `<rect x="${box.x}" y="${box.y}" width="${box.w}" height="${box.h}" fill="none" stroke="#0D99FF" stroke-width="1"/>`
+          );
+          if (task.handles) {
+            for (const [x, y] of [
+              [box.x, box.y],
+              [box.x + box.w, box.y],
+              [box.x, box.y + box.h],
+              [box.x + box.w, box.y + box.h],
+            ]) {
+              shapes.push(
+                `<rect x="${x - 3.5}" y="${y - 3.5}" width="7" height="7" fill="#fff" stroke="#0D99FF" stroke-width="1"/>`
+              );
+            }
+            if (box.w > 16 && box.h > 12) {
+              liveBadges.add(task.id);
+              let badge = badges.get(task.id);
+              if (!badge) {
+                badge = document.createElement("div");
+                badge.className = "swarm-badge";
+                layer.appendChild(badge);
+                badges.set(task.id, badge);
+              }
+              badge.style.left = `${box.x + box.w / 2}px`;
+              badge.style.top = `${box.y + box.h + 8}px`;
+              badge.textContent = `${Math.round(box.w)} × ${Math.round(box.h)}`;
+            }
+          }
+        }
+      }
+      if (task.caret) {
+        liveCarets.add(task.id);
+        let caret = carets.get(task.id);
+        if (!caret) {
+          caret = document.createElement("div");
+          caret.className = "swarm-caret";
+          layer.appendChild(caret);
+          carets.set(task.id, caret);
+        }
+        caret.style.left = `${task.caret.x}px`;
+        caret.style.top = `${task.caret.y}px`;
+        caret.style.height = `${task.caret.h}px`;
+        caret.style.background = task.caret.color;
+      }
+    }
+
+    svg.innerHTML = shapes.join("");
+
+    for (const [id, badge] of badges) {
+      if (liveBadges.has(id)) continue;
+      badge.remove();
+      badges.delete(id);
+    }
+    for (const [id, caret] of carets) {
+      if (liveCarets.has(id)) continue;
+      caret.remove();
+      carets.delete(id);
+    }
+
+    const liveCursors = new Set();
+    for (const cursor of engine.cursors) {
+      liveCursors.add(cursor.id);
+      let record = cursors.get(cursor.id);
+      if (!record) {
+        const node = document.createElement("div");
+        node.className = "swarm-cursor";
+        const mark = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+        mark.setAttribute("width", "28");
+        mark.setAttribute("height", "28");
+        mark.setAttribute("viewBox", "0 0 28 28");
+        node.appendChild(mark);
+        layer.appendChild(node);
+        record = { node, mark, shape: "", color: "" };
+        cursors.set(cursor.id, record);
+      }
+      record.node.style.transform = `translate(${cursor.x}px, ${cursor.y}px)`;
+      if (record.shape !== cursor.shape || record.color !== cursor.color) {
+        record.mark.innerHTML = glyph(cursor.shape, cursor.color);
+        record.shape = cursor.shape;
+        record.color = cursor.color;
+      }
+      const [ox, oy] = HOT[cursor.shape];
+      const scale = 1 - cursor.press * 0.12;
+      record.mark.style.transform = `translate(${-ox}px, ${-oy}px) rotate(${cursor.angle}deg) scale(${scale})`;
+      record.mark.style.transformOrigin = `${ox}px ${oy}px`;
+    }
+    for (const [id, record] of cursors) {
+      if (liveCursors.has(id)) continue;
+      record.node.remove();
+      cursors.delete(id);
+    }
+  };
+}
+
+function marked(root) {
+  const scope = root && root !== document ? root : document;
+  return scope.querySelectorAll("[data-swarm]");
+}
+
+export function swarmify(options = {}) {
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    document.documentElement.dataset.swarmLive = "1";
+    marked(options.root).forEach((el) => {
+      el.dataset.built = "1";
+    });
+    return () => {};
+  }
+
+  const engine = new SwarmEngine(options);
+  if (!engine.tasks.length) {
+    engine.destroy();
+    console.warn("swarmify: mark the UI with data-swarm before calling swarmify().");
+    return () => {};
+  }
+
+  const layer = document.createElement("div");
+  layer.className = "swarm-layer";
+  layer.setAttribute("aria-hidden", "true");
+  document.body.appendChild(layer);
+  const paint = mount(layer);
+
+  let frame = 0;
+  let last = performance.now();
+  const loop = (now) => {
+    const dt = (now - last) / 1000;
+    last = now;
+    engine.step(dt);
+    paint(engine);
+    frame = requestAnimationFrame(loop);
+  };
+  frame = requestAnimationFrame(loop);
+
+  return () => {
+    cancelAnimationFrame(frame);
+    engine.destroy();
+    layer.remove();
+  };
+}

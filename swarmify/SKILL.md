@@ -34,12 +34,14 @@ Put `class="swarm"` on `<html>` so the hide rules apply before the script runs.
     if (document.documentElement.dataset.swarmLive === "1") return;
     document.querySelectorAll("[data-swarm]").forEach(function (el) {
       el.setAttribute("data-built", "1");
+      el.style.transform = "";
+      el.removeAttribute("data-swarm-shift");
     });
   }, 12000);
 </script>
 <noscript>
   <style>
-    html.swarm [data-swarm] { opacity: 1 !important; clip-path: none !important; }
+    html.swarm [data-swarm] { opacity: 1 !important; clip-path: none !important; transform: none !important; }
   </style>
 </noscript>
 ```
@@ -79,6 +81,14 @@ Rules:
 - One job per visible block. A heading is `type`. The card under it is `card`. The section wrapper is unmarked.
 - Leave the real text in the element. `type` reveals that text.
 
+## Groups and headings
+
+Marked elements that share a parent start a beat apart. Two of that group can be underway at once. The rest wait their turn. A faster scroll shortens the beat. A heading with no siblings, or a single card, starts as soon as it is in view.
+
+A heading is typed about 50px to the side of its final spot, shifted a few pixels up or down. A short single-line label gets the same treatment. When the typing finishes, that cursor grabs the line and drags it into place.
+
+`data-swarm-settle="off"` types a heading where it belongs. `data-swarm-settle="on"` forces the draft-and-drag on any `type` element, including a longer paragraph.
+
 ## React or Next
 
 Load the CSS from the root layout and put `className="swarm"` on `<html>`. Start the swarm from one client component:
@@ -105,6 +115,6 @@ If the reader prefers reduced motion, `swarmify()` shows the page and skips the 
 ## Check
 
 - The page is blank except the cursor ring, then the real UI appears.
-- Boxes grow from a corner of the element. Text types in place. The empty corners of the window stay clear.
+- Boxes grow from a corner of the element. A heading shows up slightly to the side, then a cursor drags it home. Sibling cards start one after another. The empty corners of the window stay clear.
 - Scrolling builds the next section. The sections above stay built.
 - With reduced motion, or with JavaScript off, the page is readable immediately.

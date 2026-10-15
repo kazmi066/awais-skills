@@ -48,6 +48,7 @@ class SwarmEngine {
     this.velocity = 0;
     this.lastScroll = 0;
     this.spawnCooldown = 0;
+    this.groupOpened = new Map();
     this.pointer = null;
     this.lastPointer = null;
     this.travel = { x: 0, y: 0 };
@@ -76,6 +77,7 @@ class SwarmEngine {
     window.removeEventListener("pointermove", this.onMove);
     window.removeEventListener("pointerleave", this.onLeave);
     for (const cursor of this.cursors) cursor.gen?.return();
+    for (const task of this.tasks) this.clearShift(task);
   }
 
   step(dt) {
@@ -137,6 +139,17 @@ class SwarmEngine {
       if (!task) continue;
       pool.splice(pool.indexOf(task), 1);
       task.state = "active";
+      this.openGroup(task);
+      if (task.groupId >= 0) {
+        const active = this.tasks.filter(
+          (item) => item.groupId === task.groupId && item.state === "active"
+        ).length;
+        if (active >= 2) {
+          for (let index = pool.length - 1; index >= 0; index -= 1) {
+            if (pool[index].groupId === task.groupId) pool.splice(index, 1);
+          }
+        }
+      }
       cursor.task = task;
       cursor.worked = true;
       cursor.idleFor = 0;
@@ -168,7 +181,10 @@ class SwarmEngine {
       } catch (error) {
         console.error(error);
         finished = true;
-        if (cursor.task) cursor.task.el.dataset.built = "1";
+        if (cursor.task) {
+          this.clearShift(cursor.task);
+          cursor.task.el.dataset.built = "1";
+        }
       }
       cursor.vx = (cursor.x - previousX) / dt;
       cursor.vy = (cursor.y - previousY) / dt;
@@ -181,6 +197,7 @@ class SwarmEngine {
         task.showSelection = false;
         task.draw = null;
         task.caret = null;
+        this.clearShift(task);
         if (!task.el.dataset.built) task.el.dataset.built = "1";
         cursor.task = null;
         cursor.shape = "arrow";
@@ -244,9 +261,11 @@ class SwarmEngine {
       const mid = this.viewWidth / 2;
       return { left: mid - 280, right: mid + 280 };
     }
+    const leftOf = (task) => (task.homeW ? task.homeX : task.x);
+    const widthOf = (task) => (task.homeW ? task.homeW : task.w);
     return {
-      left: Math.min(...placed.map((task) => task.x)),
-      right: Math.max(...placed.map((task) => task.x + task.w)),
+      left: Math.min(...placed.map(leftOf)),
+      right: Math.max(...placed.map((task) => leftOf(task) + widthOf(task))),
     };
   }
 
@@ -293,9 +312,74 @@ class SwarmEngine {
         lines: 1,
         caret: null,
         visibleFor: 0,
+        groupId: -1,
+        groupIndex: 0,
+        homeX: 0,
+        homeY: 0,
+        homeW: 0,
+        homeH: 0,
+        tx: 0,
+        ty: 0,
       };
       this.measure(task, true);
       this.tasks.push(task);
+    });
+    this.assignGroups();
+  }
+
+  assignGroups() {
+    const groups = new Map();
+    for (const task of this.tasks) {
+      const parent = task.el.parentElement;
+      if (!parent) continue;
+      const list = groups.get(parent) || [];
+      list.push(task);
+      groups.set(parent, list);
+    }
+    let id = 0;
+    for (const members of groups.values()) {
+      if (members.length < 2) continue;
+      const groupId = id++;
+      members.forEach((task, index) => {
+        task.groupId = groupId;
+        task.groupIndex = index;
+      });
+    }
+  }
+
+  staggerGap() {
+    return clamp(0.52 - this.velocity / 3500, 0.24, 0.52);
+  }
+
+  leadOf(groupId) {
+    let above = null;
+    for (const task of this.tasks) {
+      if (task.groupId !== groupId || task.state !== "wait") continue;
+      if (task.y > this.frontier || task.w <= 1 || task.h <= 1) continue;
+      const inView = task.y < this.viewBottom && task.y + task.h > this.viewTop - 40;
+      if (inView) return task;
+      if (!above) above = task;
+    }
+    return above;
+  }
+
+  groupReady(task) {
+    if (task.groupId < 0) return true;
+    const opened = this.groupOpened.get(task.groupId);
+    if (!opened) return task === this.leadOf(task.groupId);
+    if (this.time < opened.at + task.groupIndex * opened.gap) return false;
+    const active = this.tasks.filter(
+      (item) => item.groupId === task.groupId && item.state === "active"
+    ).length;
+    return active < 2;
+  }
+
+  openGroup(task) {
+    if (task.groupId < 0 || this.groupOpened.has(task.groupId)) return;
+    const gap = this.staggerGap();
+    this.groupOpened.set(task.groupId, {
+      at: this.time - task.groupIndex * gap,
+      gap,
     });
   }
 
@@ -326,7 +410,12 @@ class SwarmEngine {
 
   available() {
     return this.tasks.filter(
-      (task) => task.state === "wait" && task.y <= this.frontier && task.w > 1 && task.h > 1
+      (task) =>
+        task.state === "wait" &&
+        task.y <= this.frontier &&
+        task.w > 1 &&
+        task.h > 1 &&
+        this.groupReady(task)
     );
   }
 
@@ -338,7 +427,11 @@ class SwarmEngine {
     for (const task of tasks) {
       const band = task.y >= top && task.y <= bottom ? 0 : task.y < top ? 1 : 2;
       const distance = band === 1 ? top - task.y : task.y;
-      const score = band * 1_000_000 + distance * 0.6 + Math.abs(task.y - cursor.y) * 0.4;
+      const score =
+        band * 1_000_000 +
+        task.groupIndex * 4000 +
+        distance * 0.6 +
+        Math.abs(task.y - cursor.y) * 0.4;
       if (score < bestScore) {
         bestScore = score;
         best = task;
@@ -609,6 +702,82 @@ class SwarmEngine {
     }
   }
 
+  wantsSettle(task, text, vertical) {
+    if (task.kind !== "type" || !text) return false;
+    const flag = (task.el.dataset.swarmSettle || "").toLowerCase();
+    if (flag === "0" || flag === "off") return false;
+    if (flag === "1" || flag === "on") return true;
+    if (/^H[1-6]$/.test(task.el.tagName)) return true;
+    return !vertical && text.length <= 64;
+  }
+
+  draftOffset(task) {
+    const want = rand(46, 58);
+    const viewRight = task.homeX - window.scrollX + (task.homeW || task.w);
+    const room = this.viewWidth - 16 - viewRight;
+    return {
+      tx: Math.min(want, Math.max(24, room)),
+      ty: rand(-4, 6),
+    };
+  }
+
+  applyShift(task, tx, ty) {
+    task.tx = tx;
+    task.ty = ty;
+    task.el.dataset.swarmShift = "1";
+    task.el.style.transform = `translate(${tx.toFixed(2)}px, ${ty.toFixed(2)}px)`;
+    task.x = task.homeX + tx;
+    task.y = task.homeY + ty;
+  }
+
+  clearShift(task) {
+    if (task.el.dataset.swarmShift !== "1") return;
+    delete task.el.dataset.swarmShift;
+    task.el.style.transform = "";
+    task.tx = 0;
+    task.ty = 0;
+    if (task.homeW) {
+      task.x = task.homeX;
+      task.y = task.homeY;
+    }
+  }
+
+  finishType(task) {
+    this.clearShift(task);
+    task.el.dataset.built = "1";
+    task.el.style.removeProperty("--swarm-p");
+    task.el.style.clipPath = "";
+    delete task.el.dataset.reveal;
+  }
+
+  *placeBack(cursor, task) {
+    const fromX = task.tx;
+    const fromY = task.ty;
+    cursor.shape = "arrow";
+    yield* this.moveTo(
+      cursor,
+      {
+        x: task.x + Math.min(24, Math.max(8, task.w * 0.18)),
+        y: task.y + task.h * 0.58,
+      },
+      { bend: 0.05, speed: 0.85 }
+    );
+    const duration = clamp(0.38 + Math.hypot(fromX, fromY) / 520, 0.42, 0.72);
+    let elapsed = 0;
+    let prev = 0;
+    while (elapsed < duration) {
+      elapsed += (yield) * this.tempo;
+      const progress = easeInOut(Math.min(1, elapsed / duration));
+      this.applyShift(task, fromX * (1 - progress), fromY * (1 - progress));
+      cursor.x += (prev - progress) * fromX;
+      cursor.y += (prev - progress) * fromY;
+      cursor.press = 1;
+      prev = progress;
+    }
+    this.clearShift(task);
+    cursor.press = 0;
+  }
+
   *typeText(cursor, task) {
     this.measure(task, true);
     const text = (task.el.innerText || "").replace(/\s+/g, " ").trim();
@@ -616,38 +785,58 @@ class SwarmEngine {
     task.el.dataset.reveal = vertical ? "y" : "x";
     if (!vertical) this.measure(task);
     this.prepareLines(task);
-    task.el.style.setProperty("--swarm-p", "0");
-    cursor.shape = "arrow";
-    yield* this.moveTo(cursor, {
-      x: task.x + 2,
-      y: task.y + Math.min(task.h - 4, this.lineHeight(task) * 0.75),
-    });
-    cursor.press = 1;
-    cursor.shape = "ibeam";
-    task.showSelection = true;
-    if (!text) {
-      task.el.dataset.built = "1";
-      task.showSelection = false;
+    task.homeX = task.x;
+    task.homeY = task.y;
+    task.homeW = task.w;
+    task.homeH = task.h;
+    const settle = this.wantsSettle(task, text, vertical);
+    if (settle) {
+      const draft = this.draftOffset(task);
+      this.applyShift(task, draft.tx, draft.ty);
+    }
+    let placed = false;
+    try {
+      task.el.style.setProperty("--swarm-p", "0");
       cursor.shape = "arrow";
-      return;
+      yield* this.moveTo(cursor, {
+        x: task.x + 2,
+        y: task.y + Math.min(task.h - 4, this.lineHeight(task) * 0.75),
+      });
+      cursor.press = 1;
+      cursor.shape = "ibeam";
+      task.showSelection = true;
+      if (!text) {
+        this.finishType(task);
+        placed = true;
+        task.showSelection = false;
+        cursor.shape = "arrow";
+        return;
+      }
+      const count = text.length;
+      for (let index = 1; index <= count; index += 1) {
+        task.progress = index / count;
+        this.applyTypeClip(task, vertical);
+        this.placeCaret(cursor, task, vertical);
+        let delay = count > 90 ? rand(0.004, 0.01) : rand(0.012, 0.032);
+        if (text[index - 1] === " ") delay += rand(0, 0.018);
+        if (Math.random() < 0.02) delay += rand(0.05, 0.14);
+        yield* this.wait(delay);
+      }
+      task.el.style.setProperty("--swarm-p", "1");
+      task.el.style.clipPath = "";
+      cursor.shape = "arrow";
+      task.caret = null;
+      if (settle) {
+        yield* this.wait(0.06);
+        yield* this.placeBack(cursor, task);
+      }
+      task.showSelection = false;
+      yield* this.wait(0.05);
+      this.finishType(task);
+      placed = true;
+    } finally {
+      if (!placed) this.clearShift(task);
     }
-    const count = text.length;
-    for (let index = 1; index <= count; index += 1) {
-      task.progress = index / count;
-      this.applyTypeClip(task, vertical);
-      this.placeCaret(cursor, task, vertical);
-      let delay = count > 90 ? rand(0.004, 0.01) : rand(0.012, 0.032);
-      if (text[index - 1] === " ") delay += rand(0, 0.018);
-      if (Math.random() < 0.02) delay += rand(0.05, 0.14);
-      yield* this.wait(delay);
-    }
-    task.el.dataset.built = "1";
-    task.el.style.removeProperty("--swarm-p");
-    task.el.style.clipPath = "";
-    cursor.shape = "arrow";
-    task.caret = null;
-    yield* this.wait(0.16);
-    task.showSelection = false;
   }
 
   lineHeight(task) {

@@ -30,6 +30,10 @@ html.swarm [data-swarm="type"][data-reveal="y"]:not([data-built]) {
   clip-path: inset(0 0 calc((1 - var(--swarm-p, 0)) * 100%) 0);
 }
 
+html.swarm [data-swarm-shift] {
+  transition: none !important;
+}
+
 @media (prefers-reduced-motion: reduce) {
   html.swarm [data-swarm="frame"]:not([data-built]),
   html.swarm [data-swarm="card"]:not([data-built]) {
@@ -38,6 +42,10 @@ html.swarm [data-swarm="type"][data-reveal="y"]:not([data-built]) {
 
   html.swarm [data-swarm="type"]:not([data-built]) {
     clip-path: none;
+  }
+
+  html.swarm [data-swarm-shift] {
+    transform: none !important;
   }
 }
 

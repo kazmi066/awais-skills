@@ -10,6 +10,6 @@ Paste the file into a chat, or save it as `SKILL.md` where your agent loads skil
 
 ## Swarmify
 
-`swarmify/SKILL.md` puts a swarm of cursors on a page you already have. The cursors draw and type the marked UI as the reader scrolls. Copy `swarmify/swarm.css` and `swarmify/swarm.js` into the project.
+`swarmify/SKILL.md` puts a swarm of cursors on a page you already have. The cursors draw and type the marked UI as the reader scrolls. Sibling items start a beat apart. Headings are typed slightly to the side, then a cursor drags them into place. Copy `swarmify/swarm.css` and `swarmify/swarm.js` into the project.
 
 Paste `swarmify/SKILL.md` into a chat, or save it as `SKILL.md` where your agent loads skills.
